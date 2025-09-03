@@ -8,7 +8,7 @@ const model = genAI.getGenerativeModel({
 });
 
 const generationConfig = {
-  temperature: 1,
+  temperature: 0.7,
   topP: 0.95,
   topK: 64,
   maxOutputTokens: 8192,
@@ -38,3 +38,38 @@ export const chatSession = model.startChat({
     },
   ],
 });
+
+// Helper function to send message with timeout
+export const sendMessageWithTimeout = async (prompt, timeoutMs = 30000) => {
+  return new Promise((resolve, reject) => {
+    // Check network connectivity first
+    if (!navigator.onLine) {
+      reject(new Error('No internet connection. Please check your network.'));
+      return;
+    }
+
+    const timeoutId = setTimeout(() => {
+      reject(new Error('AI request timed out. Please try again.'));
+    }, timeoutMs);
+
+    chatSession.sendMessage(prompt)
+      .then((result) => {
+        clearTimeout(timeoutId);
+        resolve(result);
+      })
+      .catch((error) => {
+        clearTimeout(timeoutId);
+        
+        // Handle specific error types
+        if (error.message.includes('API key')) {
+          reject(new Error('AI service configuration error. Please contact support.'));
+        } else if (error.message.includes('quota')) {
+          reject(new Error('AI service quota exceeded. Please try again later.'));
+        } else if (error.message.includes('network')) {
+          reject(new Error('Network error. Please check your internet connection.'));
+        } else {
+          reject(error);
+        }
+      });
+  });
+};

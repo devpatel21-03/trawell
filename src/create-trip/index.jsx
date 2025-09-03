@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
-import GooglePlacesAutocomplete from "react-google-places-autocomplete";
+//import GooglePlacesAutocomplete from "react-google-places-autocomplete";
 import _ from "lodash";
 import { Input } from "@/components/ui/input";
+import CustomPlacesAutocomplete from "@/components/CustomPlacesAutocomplete";
 import {
   AI_PROMPT,
   SelectBudgetOptions,
@@ -10,7 +11,9 @@ import {
 } from "@/constants/options";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
-import { chatSession } from "@/service/AIModel";
+import { sendMessageWithTimeout } from "@/service/AIModel";
+import Spinner from "@/components/ui/spinner";
+import { logEnvironmentStatus } from "@/utils/envCheck";
 import {
   Dialog,
   DialogContent,
@@ -19,17 +22,26 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+
 import { useGoogleLogin } from "@react-oauth/google";
 import { doc, setDoc } from "firebase/firestore";
-import { db } from "@/service/firebaseConfig";
+import { db, saveDataWithRetry, testFirestoreConnection } from "@/service/firebaseConfig";
 import { useNavigate } from "react-router-dom";
 
 const CreateTrip = () => {
   const [place, setPlace] = useState("");
   const [openDialog, setOpenDialog] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [loadingStep, setLoadingStep] = useState("");
   const [formData, setFormData] = useState([]);
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+  const [firebaseConnected, setFirebaseConnected] = useState(false);
   const navigate = useNavigate();
+
+  // Log environment status on component mount
+  useEffect(() => {
+    logEnvironmentStatus();
+  }, []);
 
   const handleInputChange = (name, value) => {
     setFormData({ ...formData, [name]: value });
@@ -38,6 +50,40 @@ const CreateTrip = () => {
   useEffect(() => {
     console.log(formData);
   }, [formData]);
+
+  // Monitor network status
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  // Monitor Firebase connection status
+  useEffect(() => {
+    const checkFirebaseConnection = async () => {
+      try {
+        const isConnected = await testFirestoreConnection();
+        setFirebaseConnected(isConnected);
+      } catch (error) {
+        console.error("Firebase connection check failed:", error);
+        setFirebaseConnected(false);
+      }
+    };
+
+    checkFirebaseConnection();
+    
+    // Check connection every 30 seconds
+    const interval = setInterval(checkFirebaseConnection, 30000);
+    
+    return () => clearInterval(interval);
+  }, []);
 
   const login = useGoogleLogin({
     onSuccess: (tokenResponse) => GetUserProfile(tokenResponse),
@@ -57,6 +103,31 @@ const CreateTrip = () => {
       return;
     }
 
+    // Validate user data
+    try {
+      const userData = JSON.parse(user);
+      if (!userData.email) {
+        throw new Error("Invalid user data");
+      }
+      
+      // Check if user data is recent (not older than 24 hours)
+      const userTimestamp = userData.timestamp || 0;
+      const now = Date.now();
+      const twentyFourHours = 24 * 60 * 60 * 1000;
+      
+      if (now - userTimestamp > twentyFourHours) {
+        console.log("User data is too old, requiring re-authentication");
+        localStorage.removeItem("user");
+        setOpenDialog(true);
+        return;
+      }
+    } catch (error) {
+      console.error("Invalid user data:", error);
+      localStorage.removeItem("user");
+      setOpenDialog(true);
+      return;
+    }
+
     if (formData?.noOfDays > 7) {
       toast("Please enter no. of days less than 8");
       return;
@@ -70,20 +141,79 @@ const CreateTrip = () => {
       toast("Please enter all the details");
       return;
     }
-    setLoading(true);
-    const FINAL_PROMPT = AI_PROMPT.replace(
-      "{location}",
-      formData?.location?.label
-    )
-      .replace("{totalDays}", formData?.noOfDays)
-      .replace("{traveler}", formData?.noOfPeople)
-      .replace("{budget}", formData?.budget)
-      .replace("{totalDays}", formData?.noOfDays);
+    
+    try {
+      setLoading(true);
+      setLoadingStep("Generating AI travel plan...");
+      
+      // Check if API key is available
+      const apiKey = import.meta.env.VITE_GOOGLE_GEMINI_AI_API_KEY;
+      if (!apiKey) {
+        throw new Error("Google Gemini AI API key is not configured");
+      }
+      
+      const FINAL_PROMPT = AI_PROMPT.replace(
+        "{location}",
+        formData?.location?.label
+      )
+        .replace("{totalDays}", formData?.noOfDays)
+        .replace("{traveler}", formData?.noOfPeople)
+        .replace("{budget}", formData?.budget)
+        .replace("{totalDays}", formData?.noOfDays);
 
-    const result = await chatSession.sendMessage(FINAL_PROMPT);
-    console.log("--", result?.response?.text());
-    setLoading(false);
-    SaveAiTrip(result?.response?.text());
+      console.log("Sending prompt to AI:", FINAL_PROMPT);
+      console.log("API Key available:", !!apiKey);
+      
+      // Try up to 3 times with exponential backoff
+      let result;
+      let lastError;
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          result = await sendMessageWithTimeout(FINAL_PROMPT, 45000); // 45 second timeout
+          console.log("AI Response:", result?.response?.text());
+          break; // Success, exit the retry loop
+        } catch (error) {
+          lastError = error;
+          console.error(`Attempt ${attempt} failed:`, error);
+          if (attempt < 3) {
+            setLoadingStep(`Retrying... (Attempt ${attempt + 1}/3)`);
+            await new Promise(resolve => setTimeout(resolve, 2000 * attempt)); // Exponential backoff
+          }
+        }
+      }
+      
+      if (!result) {
+        throw lastError || new Error("All attempts to generate trip failed");
+      }
+      
+      if (!result?.response?.text()) {
+        throw new Error("No response received from AI");
+      }
+      
+      // Validate that the response contains JSON
+      const responseText = result.response.text();
+      if (!responseText.includes('{') || !responseText.includes('}')) {
+        throw new Error("AI response is not in valid JSON format");
+      }
+      
+      setLoadingStep("Saving trip to database...");
+      await SaveAiTrip(responseText);
+    } catch (error) {
+      console.error("Error generating trip:", error);
+      setLoading(false);
+      setLoadingStep("");
+      
+      let errorMessage = "Failed to generate trip. Please try again.";
+      if (error.message.includes("API key")) {
+        errorMessage = "AI service is not properly configured. Please contact support.";
+      } else if (error.message.includes("timed out")) {
+        errorMessage = "Request timed out. Please try again.";
+      } else if (error.message.includes("JSON format")) {
+        errorMessage = "Received invalid response from AI. Please try again.";
+      }
+      
+      toast.error(errorMessage);
+    }
   };
 
   const GetUserProfile = (tokenInfo) => {
@@ -99,7 +229,12 @@ const CreateTrip = () => {
       )
       .then((resp) => {
         console.log(resp.data);
-        localStorage.setItem("user", JSON.stringify(resp.data));
+        // Add timestamp to user data
+        const userDataWithTimestamp = {
+          ...resp.data,
+          timestamp: Date.now()
+        };
+        localStorage.setItem("user", JSON.stringify(userDataWithTimestamp));
         setOpenDialog(false);
         onGenerateTrip();
       })
@@ -109,16 +244,62 @@ const CreateTrip = () => {
   };
 
   const SaveAiTrip = async (TripData) => {
-    setLoading(true);
-    const user = JSON.parse(localStorage.getItem("user"));
-    const docId = Date.now().toString();
-    await setDoc(doc(db, "AITrips", docId), {
-      userChoice: formData,
-      tripData: JSON.parse(TripData),
-      userEmail: user?.email,
-      id: docId,
-    });
-    navigate("/view-trip/" + docId);
+    try {
+      const user = JSON.parse(localStorage.getItem("user"));
+      const docId = Date.now().toString();
+      
+      // Test Firestore connection first
+      setLoadingStep("Testing database connection...");
+      const isConnected = await testFirestoreConnection();
+      if (!isConnected) {
+        throw new Error("Database connection failed");
+      }
+      
+      // Try to parse the AI response as JSON
+      let parsedTripData;
+      try {
+        parsedTripData = JSON.parse(TripData);
+      } catch (parseError) {
+        console.error("Failed to parse AI response as JSON:", parseError);
+        console.log("Raw AI response:", TripData);
+        toast.error("Invalid response format from AI. Please try again.");
+        setLoading(false);
+        setLoadingStep("");
+        return;
+      }
+      
+      setLoadingStep("Saving trip data...");
+      const tripData = {
+        userChoice: formData,
+        tripData: parsedTripData,
+        userEmail: user?.email,
+        id: docId,
+        createdAt: new Date().toISOString(),
+      };
+      
+      // Use retry logic for saving data
+      await saveDataWithRetry("AITrips", docId, tripData, 3);
+      
+      setLoading(false);
+      setLoadingStep("");
+      toast.success("Trip generated successfully!");
+      navigate("/view-trip/" + docId);
+    } catch (error) {
+      console.error("Error saving trip:", error);
+      setLoading(false);
+      setLoadingStep("");
+      
+      let errorMessage = "Failed to save trip. Please try again.";
+      if (error.message.includes("Database connection failed")) {
+        errorMessage = "Database connection failed. Please check your internet connection.";
+      } else if (error.message.includes("permission")) {
+        errorMessage = "Permission denied. Please sign in again.";
+      } else if (error.message.includes("quota")) {
+        errorMessage = "Database quota exceeded. Please try again later.";
+      }
+      
+      toast.error(errorMessage);
+    }
   };
 
   return (
@@ -140,13 +321,7 @@ const CreateTrip = () => {
         <label className="text-black text-2xl font-semibold mb-2">
           What is your Destination?
         </label>
-        <GooglePlacesAutocomplete
-          apiKey={import.meta.env.VITE_GOOGLE_PLACE_API_KEY}
-          selectProps={{
-            placeholder: "Search for places...",
-            onChange: handleSelect,
-          }}
-        />
+        <CustomPlacesAutocomplete onSelect={handleSelect} />
       </div>
 
       {/* Number of Days */}
@@ -214,14 +389,61 @@ const CreateTrip = () => {
         </div>
       </div>
 
+      {/* Loading Step Indicator */}
+      {loading && loadingStep && (
+        <div className="flex justify-center w-full max-w-2xl mb-4">
+          <div className="bg-blue-50 border border-blue-200 rounded-lg px-4 py-2">
+            <div className="flex items-center gap-2">
+              <Spinner size="sm" />
+              <span className="text-blue-700 font-medium">{loadingStep}</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Network Status Indicator */}
+      {!isOnline && (
+        <div className="flex justify-center w-full max-w-2xl mb-4">
+          <div className="bg-red-50 border border-red-200 rounded-lg px-4 py-2">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+              <span className="text-red-700 font-medium">You are offline. Please check your internet connection.</span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Firebase Connection Status Indicator */}
+      {!firebaseConnected && isOnline && (
+        <div className="flex justify-center w-full max-w-2xl mb-4">
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg px-4 py-2">
+            <div className="flex items-center gap-2">
+              <div className="w-2 h-2 bg-yellow-500 rounded-full"></div>
+              <span className="text-yellow-700 font-medium">Database connection issue. Trying to reconnect...</span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Generate Trip Button */}
       <div className="flex justify-center w-full max-w-2xl">
         <Button
           onClick={onGenerateTrip}
-          disabled={loading}
+          disabled={loading || !isOnline || !firebaseConnected}
           className="w-full py-3 text-lg"
         >
-          {loading ? "Generating Trip..." : "Generate Trip"}
+          {loading ? (
+            <div className="flex items-center gap-2">
+              <Spinner size="sm" />
+              <span>Generating Trip...</span>
+            </div>
+          ) : !isOnline ? (
+            "No Internet Connection"
+          ) : !firebaseConnected ? (
+            "Database Not Connected"
+          ) : (
+            "Generate Trip"
+          )}
         </Button>
       </div>
 

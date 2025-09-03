@@ -1,34 +1,34 @@
-// import axios from "axios";
-
-// export const GetPlaceDetails = async () => {
-//   try {
-//     const response = await axios.get(
-//       "https://places.googleapis.com/v1/places:searchText",
-//       {
-//         headers: {
-//           Authorization: `Bearer AIzaSyDGfDWOQ0vk1Z_4-Wbh0-J3XgzH917ELIQ`,
-//           // Include other headers if necessary
-//         },
-//       }
-//     );
-//     console.log(response.data);
-//   } catch (error) {
-//     console.error(
-//       "Error fetching data:",
-//       error.response ? error.response.data : error.message
-//     );
-//   }
-// };
-
+// src/service/GlobalApi.jsx
 import axios from "axios";
+
 const BASE_URL = "https://places.googleapis.com/v1/places:searchText";
 
-const config = {
-  headers: {
-    "Content-Type": "application/json",
-    "X-Goog-Api-Key": import.meta.env.VITE_GOOGLE_PLACE_API_KEY,
-    "X-Goog-FieldMask": ["places.photos", "places.displayName", "places.id"],
-  },
+// Call Places API and return an ARRAY: places[]
+export const GetPlaceDetails = async (textQuery) => {
+  if (!textQuery || typeof textQuery !== "string") {
+    throw new Error("GetPlaceDetails: textQuery must be a non-empty string");
+  }
+
+  const resp = await axios.post(
+    BASE_URL,
+    { textQuery },
+    {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": import.meta.env.VITE_GOOGLE_PLACE_API_KEY,
+        // ask explicitly for photos metadata
+        "X-Goog-FieldMask":
+          "places.displayName,places.formattedAddress,places.photos.name,places.photos.widthPx,places.photos.heightPx",
+      },
+    }
+  );
+
+  return resp?.data?.places ?? []; // <-- ALWAYS an array
 };
 
-export const GetPlaceDetails = (data) => axios.post(BASE_URL, data, config);
+// Build a usable image URL from photo metadata
+export const getPlacePhotoUrl = (photo) => {
+  const name = photo?.name;
+  if (!name) return null;
+  return `https://places.googleapis.com/v1/${name}/media?maxHeightPx=600&maxWidthPx=800&key=${import.meta.env.VITE_GOOGLE_PLACE_API_KEY}`;
+};
